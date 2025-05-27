@@ -1,0 +1,938 @@
+---
+title: "Time series project"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width = 12, fig.height = 8)
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(xts)
+library(rugarch)
+library(mgcv)
+library(tseries)
+library(vars)
+library(forecast)
+library(aod)
+library(lubridate)
+library(xts)
+library(FinTS)
+library(aod)
+library(MASS)
+library(foreach)
+library(doParallel)
+```
+
+## Data cleaning 
+
+First we upload and clean the original data. We create 3 new datasets where we aggregate the readings by 1 hour, 4 hours and 8 hours. We average the temperature, humidity, and diffusion flow variables and sum the power consumption for the appropiate time. 
+
+```{r}
+
+#load data
+data_og <- read_csv("data_power.csv")
+
+#create time variables and rename
+data_og <- data_og %>%
+  mutate(dateTime = mdy_hm(DateTime)) %>%
+  rename(temperature = Temperature, humidity = Humidity, wind_speed = `Wind Speed`, 
+         general_diffuse_flows = `general diffuse flows`, diffuse_flows = `diffuse flows`,
+         power_zone1 = `Zone 1 Power Consumption`, power_zone2 = `Zone 2  Power Consumption`,
+         power_zone3 = `Zone 3  Power Consumption`)
+
+
+#aggregate by hour (every 6 observations) 
+data_1hour <- data_og %>%
+  mutate(rowNumber = row_number()-1) %>%
+  mutate(index = rowNumber %/%6) %>%
+  group_by(index) %>%
+  summarise(dateTime = min(dateTime),
+            temperature = mean(temperature), humidity = mean(humidity),
+            wind_speed = mean(wind_speed), general_diffuse_flows = mean(general_diffuse_flows),
+            power_zone1 = sum(power_zone1),  power_zone2 = sum(power_zone2),
+            power_zone3 = sum(power_zone3))
+
+
+#aggregate by 4 hours (every 24 observations)
+data_4hours <- data_og %>%
+  mutate(rowNumber = row_number()-1) %>%
+  mutate(index = rowNumber %/% 24 ) %>%
+  group_by(index) %>%
+  summarise(dateTime = min(dateTime),
+            temperature = mean(temperature), humidity = mean(humidity),
+            wind_speed = mean(wind_speed), general_diffuse_flows = mean(general_diffuse_flows),
+            power_zone1 = sum(power_zone1),  power_zone2 = sum(power_zone2),
+            power_zone3 = sum(power_zone3))
+
+#aggregate by 8 hours (every 48 observations)
+data_8hours <- data_og %>%
+  mutate(rowNumber = row_number()-1) %>%
+  mutate(index = rowNumber %/% 48 ) %>%
+  group_by(index) %>%
+  summarise( dateTime = min(dateTime),
+            temperature = mean(temperature), humidity = mean(humidity),
+            wind_speed = mean(wind_speed), general_diffuse_flows = mean(general_diffuse_flows),
+            power_zone1 = sum(power_zone1),  power_zone2 = sum(power_zone2),
+            power_zone3 = sum(power_zone3))
+
+```
+
+## Raw data exploration 
+
+We plot the time series using the different aggregation methods to see trend and seasonality patterns in the data. 
+```{r}
+
+pc_vars <- c("power_zone1", "power_zone2", "power_zone3")
+external_vars <- c("temperature", "humidity", "general_diffuse_flows", "diffuse_flows")
+
+#plot 
+data_og %>%
+  select(c("dateTime", all_of(pc_vars))) %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  ggplot() + geom_line(aes(x= dateTime, y = value)) + facet_wrap(~variable, ncol = 1) + theme_bw() 
+
+data_1hour %>%
+  select(c("dateTime", all_of(pc_vars))) %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  ggplot() + geom_line(aes(x= dateTime, y = value)) + facet_wrap(~variable, ncol = 1) + theme_bw() 
+
+data_4hours %>%
+  select(c("dateTime", all_of(pc_vars))) %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  ggplot() + geom_line(aes(x= dateTime, y = value)) + facet_wrap(~variable, ncol = 1) + theme_bw() 
+
+data_8hours %>%
+  select(c("dateTime", all_of(pc_vars))) %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  ggplot() + geom_line(aes(x= dateTime, y = value)) + facet_wrap(~variable, ncol = 1) + theme_bw() 
+
+#check only 1 day to see patterns more clearly 
+data_1hour %>%
+  select(c("dateTime", all_of(pc_vars))) %>%
+  filter(dateTime >=  as.Date("2017-01-01"), dateTime <  as.Date("2017-01-02")) %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  mutate(dateTime = format(as.POSIXct(dateTime), format = "%H:%M")) %>%
+  ggplot() + geom_line(aes(x= dateTime, y = value, group = 1)) + facet_wrap(~variable, ncol = 1) + theme_bw() 
+
+#check one week 
+data_8hours %>%
+  select(c("dateTime", all_of(pc_vars))) %>%
+  filter(dateTime < as.Date("2017-01-09")) %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  mutate(dateTime = format(as.POSIXct(dateTime), format = "%Y/%m/%d %H:%M")) %>%
+  ggplot() + geom_line(aes(x= dateTime, y = value, group = 1)) + facet_wrap(~variable, ncol = 1) + theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+#box plot for time of the day
+data_1hour %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  mutate(time = format(as.POSIXct(dateTime), format = "%H:%M")) %>%
+  ggplot() + geom_boxplot(aes(x= time, y = value)) + facet_wrap(~variable, ncol = 1) + 
+theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+data_4hours %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  mutate(time = format(as.POSIXct(dateTime), format = "%H:%M")) %>%
+  ggplot() + geom_boxplot(aes(x= time, y = value)) + facet_wrap(~variable, ncol = 1) + 
+theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+data_8hours %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  mutate(time = format(as.POSIXct(dateTime), format = "%H:%M")) %>%
+  ggplot() + geom_boxplot(aes(x= time, y = value)) + facet_wrap(~variable, ncol = 1) + 
+theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+#box plot for day of the week
+days.of.week <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+data_1hour %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  mutate(dayofweek = weekdays(dateTime)) %>%
+  mutate(dayofweek = factor(dayofweek, levels = days.of.week)) %>%
+    ggplot() + geom_boxplot(aes(x= dayofweek, y = value)) + facet_wrap(~variable, ncol = 1) + 
+theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+#box plot for month 
+data_1hour %>%
+  pivot_longer(cols = c(power_zone1:power_zone3), names_to = "variable", values_to = "value") %>%
+  mutate(month =format(dateTime,"%B")) %>%
+  mutate(month = factor(month, levels = month.name)) %>%
+    ggplot() + geom_boxplot(aes(x= month, y = value)) + facet_wrap(~variable, ncol = 1) + 
+theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+
+
+
+
+#My code starts from here
+
+
+## Trend and Seasonality
+From the previous analysis, we plot the boxplot for various seasonality. The results show that the hourly seasonality in a day and monthly seasonality in a year are the most significant factors.
+```{r}
+#split the dataset
+data_1hour_training = data_1hour[-(nrow(data_1hour)-335):-nrow(data_1hour),]
+data_1hour_testing = data_1hour[(nrow(data_1hour)-335):nrow(data_1hour),]
+
+# convert X axis to 0-1 scale
+points <- 1:nrow(data_1hour_training)
+points <- (points - min(points)) / max(points)
+# 1. Fit a moving average model
+mav.data_1hour.model <- ksmooth(points, data_1hour_training$power_zone1, kernel = "box")
+
+# 2. Fit a parametric quadratic polynomial model
+x1 <- points
+x2 <- points^2
+para.data_1hour.model <- lm(data_1hour_training$power_zone1 ~ x1 + x2)
+
+# 3. Fit a local polynomial model
+loc.data_1hour.model <- loess(data_1hour_training$power_zone1 ~ points)
+
+# 4. Fit a splines smoothing model
+gam.data_1hour.model <- gam(data_1hour_training$power_zone1 ~ s(points))
+
+ylim = c(min(data_1hour_training$power_zone1),max(data_1hour_training$power_zone1))
+plot(data_1hour_training$dateTime, data_1hour_training$power_zone1,lwd=1, type="l",ylim = ylim,xlab = "Time",ylab="Power Consumption", main = "Hourly power consupmtion in Zone1")
+lines(data_1hour_training$dateTime,mav.data_1hour.model$y,lwd = 4, col = "red")
+lines(data_1hour_training$dateTime,fitted(para.data_1hour.model), lwd = 4,col = "orange")
+lines(data_1hour_training$dateTime,fitted(loc.data_1hour.model), lwd = 4,col = "green")
+lines(data_1hour_training$dateTime,fitted(gam.data_1hour.model), lwd = 4,col = "blue")
+legend("topright",  # Change to an appropriate location on the plot
+       legend = c("MAV", "PARA", "LOC", "GAM"),
+       col = c("red", "orange", "green", "blue"),
+       lty = 1,  # Line type, ensure this matches your plot lines
+       lwd = 4,  # Line width, ensure this matches your plot lines
+       cex = 0.8)  # Adjust text size as needed
+```
+
+We can see the spline fit the model best. 
+
+```{r}
+#Trend and hourly seasonality
+data_training = data.frame(power=data_1hour_training$power_zone1,points=points,hour=factor(hour(data_1hour_training$dateTime)),weekday=factor(wday(data_1hour_training$dateTime)),month=factor(month(data_1hour_training$dateTime)))
+gam.data_1hour.model <- gam(power~s(points)+hour+weekday+month,data=data_training)
+
+summary(gam.data_1hour.model)
+plot(data_1hour_training$dateTime, data_1hour_training$power_zone1,lwd=1, type="l",ylim = ylim,xlab = "Time",ylab="Power Consumption", main = "Hourly power consupmtion in Zone1")
+lines(data_1hour_training$dateTime,fitted(gam.data_1hour.model), lwd = 1,col = "red")
+legend('topleft', legend = c("Actual value", "Fitted Value"), lwd = 1,
+       col = c("black", "red"))
+
+acf(residuals(gam.data_1hour.model), lag.max=500)
+```
+
+The ACF plot clearly indicates nonstationarity, try with seasonal ARMA
+# Seasonal ARMA
+```{r}
+#get the residuals
+resid=residuals(gam.data_1hour.model)
+#select the order
+test_model <- function(p,q,m,n){
+  model = arima(resid, order = c(p,0,q),
+                      seasonal = list(order = c(m,0,n),period=24),method = "ML")
+  current.aic = model$aic
+  df = data.frame(p,q,m,n,current.aic)
+  names(df) <- c("p","q","m","n","AIC")
+  #print(paste(p,d,q,current.aic,sep=" "))
+  return(df)
+}
+
+orders = data.frame(Inf,Inf,Inf,Inf,Inf)
+names(orders) <- c("p","q","m","n","AIC")
+
+#Orders for DAL
+for (p in 0:1){
+  for (q in 0:1){
+    for (m in 0:1) {
+      for (n in 0:1){
+        possibleError <- tryCatch(
+        orders<-rbind(orders,test_model(p,q,m,n)),
+        error=function(e) e
+      )
+        print(n)
+      if(inherits(possibleError, "error")) next
+      }
+    }
+  }
+}
+orders <- orders[order(-orders$AIC),]
+tail(orders,5)
+```
+
+```{r}
+#final sarma fit
+par(mfrow = c(1, 2))
+model.sarma = arima(resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML")
+acf(residuals(model.sarma),lag.max=500, main = "ACF of Residuals of ARIMA model")
+acf(residuals(model.sarma)^2,lag.max=500, main = "ACF of Squared Residuals of ARIMA model")
+par(mfrow = c(1,1))
+```
+```{r}
+
+#for prediction
+#this is the sequential code, which takes 10-20 minutes
+new_data=data.frame(power=data_1hour_testing$power_zone1, points=(data_1hour_testing$index)/length(data_1hour_training$index),hour=hour(data_1hour_testing$dateTime),weekday=wday(data_1hour_testing$dateTime),month=month(data_1hour_testing$dateTime))
+
+fore.series.gam = rep(0, length(data_1hour_testing$index))
+fore.series.arma = rep(0, length(data_1hour_testing$index))
+fore.sigma = rep(0, length(data_1hour_testing$index))
+for(f in 1: length(data_1hour_testing$index)){
+    ## Fit models
+    data = data_training
+    if(f>=2){
+       data = rbind(data,new_data[1:f-1,])
+    }
+    model <- gam(power~s(points)+hour+weekday+month,data=data)
+    model.resid = residuals(model)
+    model.sarma.resid = arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML")
+    outpred = predict(model.sarma.resid,n.ahead=1)
+    fore.series.gam[f] = predict(model, newdata = new_data[f,])
+    fore.series.arma[f] = outpred$pred
+    fore.sigma[f] = outpred$se
+    print(f)
+}
+```
+
+```{r}
+#parallel code takes several minutes
+library(foreach)
+library(doParallel)
+library(mgcv)
+library(forecast)  
+
+# Register the parallel backend
+no_cores <- detectCores() - 1  # Use all but one of the available cores
+cl <- makeCluster(no_cores)
+registerDoParallel(cl)
+
+results <- foreach(f = 1:length(data_1hour_testing$index), .combine = rbind, .packages = c("mgcv", "forecast")) %dopar% {
+    # Prepare the data
+    data <- if(f >= 2) rbind(data_training, new_data[1:(f-1),]) else data_training
+
+    # Fit the GAM model
+    model <- gam(power ~ s(points) + hour + weekday + month, data = data)
+    
+    # Work with residuals for ARIMA model
+    model.resid <- residuals(model)
+    model.sarma.resid <- arima(model.resid, order = c(1, 0, 1),
+                               seasonal = list(order = c(1, 0, 1), period = 24), method = "ML")
+    outpred <- predict(model.sarma.resid, n.ahead = 1)
+
+    # Prepare the predictions
+    gam_pred <- predict(model, newdata = new_data[f,])
+    arma_pred <- outpred$pred
+    sigma_pred <- outpred$se
+
+    # Combine results
+    c(fore.series.gam = gam_pred, fore.series.arma = arma_pred, fore.sigma = sigma_pred)
+}
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+# Extract results
+fore.series.gam <- results[, "fore.series.gam.1"]
+fore.series.arma <- results[, "fore.series.arma"]
+fore.sigma <- results[, "fore.sigma"]
+```
+
+```{r}
+#plot the result
+plot(c(data_1hour_training$dateTime[(length(data_1hour_training$dateTime)-50):length(data_1hour_training$dateTime)], data_1hour_testing$dateTime), c(data_1hour_training$power_zone1[(length(data_1hour_training$dateTime)-50):length(data_1hour_training$dateTime)], data_1hour_testing$power_zone1) ,type = "l", main="Zone 1 Power Comsumption", xlab="Time", ylab="Power Consumption")
+points(data_1hour_testing$dateTime, fore.series.gam+fore.series.arma, col = "red")
+lines(data_1hour_testing$dateTime, fore.series.gam+fore.series.arma + 1.96*fore.sigma, col = "blue")
+lines(data_1hour_testing$dateTime, fore.series.gam+fore.series.arma - 1.96*fore.sigma, col = "blue")
+
+legend("topleft",  # Adjust the location as needed
+       legend = c("Actual Power Consumption", "Predicted Power Consumption", "95% Confidence Interval"),
+       col = c("black", "red", "blue"),
+       lty = c(1, 0, 1),  # Line types: 1 for solid, 0 for points
+       pch = c(NA, 1, NA),  # Point characters: NA for none, 1 for points
+       lwd = c(1, 1, 1))  # Line widths
+```
+
+```{r}
+#Error
+sqrt(mean((fore.series.gam+fore.series.arma - data_1hour_testing$power_zone1)^2))
+mean(abs(fore.series.gam+fore.series.arma - data_1hour_testing$power_zone1))
+```
+
+
+```{r}
+#ccf
+par(mfrow = c(2, 3))
+
+# Plot the first cross-correlation
+ccf(data_1hour_training$power_zone1, data_1hour_training$power_zone2, main = "CCF of power zone 1 and 2")
+
+# Plot the second cross-correlation
+ccf(data_1hour_training$power_zone1, data_1hour_training$power_zone3, main = "CCF of power zone 1 and 3")
+
+ccf(data_1hour_training$power_zone1, data_1hour_training$temperature, main = "CCF of power zone 1 and temperature")
+
+ccf(data_1hour_training$power_zone1, data_1hour_training$humidity, main = "CCF of power zone 1 and humidity")
+
+ccf(data_1hour_training$power_zone1, data_1hour_training$wind_speed, main = "CCF of power zone 1 and wind speed")
+
+
+# Reset the plotting layout to default (optional)
+par(mfrow = c(1, 1))
+```
+
+#ARIMAX
+```{r}
+#ARIMAX
+datalength = length(data_1hour_training$index)-4
+testlength = length(data_1hour_testing$index)
+arimax_training = data.frame(index = data_1hour_training$index[2:(datalength+1)], dateTime = data_1hour_training$dateTime[2:(datalength+1)], 
+power_zone1 = data_1hour_training$power_zone1[2:(datalength+1)],
+zone_2_hourago = data_1hour_training$power_zone2[1:datalength], 
+zone_3_hourago = data_1hour_training$power_zone2[1:datalength], 
+temperature_in3hour = data_1hour_training$temperature[5:(datalength+4)], 
+humidity_in3hour = data_1hour_training$humidity[5:(datalength+4)], 
+wind_speed_in3hour = data_1hour_training$wind_speed[5:(datalength+4)])
+
+arimax_training[,"points"] = (arimax_training$index)/length(data_1hour_training$index)
+arimax_training[,"hour"] = factor(hour(arimax_training$dateTime))
+arimax_training[,"weekday"] = factor(wday(arimax_training$dateTime))
+arimax_training[,"month"] = factor(month(arimax_training$dateTime))
+
+arimax_testing = data.frame(index = c(data_1hour_training$index[(datalength+2):(datalength+4)], data_1hour_testing$index[1:(testlength-3)]), dateTime = c(data_1hour_training$dateTime[(datalength+2):(datalength+4)], data_1hour_testing$dateTime[1:(testlength-3)]), power_zone1 = c(data_1hour_training$power_zone1[(datalength+2):(datalength+4)], data_1hour_testing$power_zone1[1:(testlength-3)]), zone_2_hourago = c(data_1hour_training$power_zone2[(datalength+1):(datalength+4)], data_1hour_testing$power_zone2[1:(testlength-4)]), zone_3_hourago = c(data_1hour_training$power_zone2[(datalength+1):(datalength+4)], data_1hour_testing$power_zone2[1:(testlength-4)]), temperature_in3hour = data_1hour_testing$temperature, humidity_in3hour = data_1hour_testing$humidity, wind_speed_in3hour = data_1hour_testing$wind_speed)
+
+arimax_testing[,"points"] = (arimax_testing$index)/length(data_1hour_training$index)
+arimax_testing[,"hour"] = factor(hour(arimax_testing$dateTime))
+arimax_testing[,"weekday"] = factor(wday(arimax_testing$dateTime))
+arimax_testing[,"month"] = factor(month(arimax_testing$dateTime))
+
+```
+
+```{r}
+#gam model
+model = gam(power_zone1 ~ s(points) + hour + weekday + month, data=arimax_training)
+model.resid = residuals(model)
+```
+
+```{r}
+#select the regressor
+regressor = arimax_training[,"zone_2_hourago"]
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = arimax_training$zone_2_hourago)
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = arimax_training[,"zone_3_hourago"])
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = arimax_training$temperature_in3hour)
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = arimax_training$humidity_in3hour)
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = arimax_training$wind_speed_in3hour)
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+```
+
+```{r}
+#second round to select regressor
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = cbind(arimax_training[,"zone_2_hourago"], arimax_training$temperature_in3hour))
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = cbind(arimax_training[,"zone_2_hourago"], arimax_training$humidity_in3hour))
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = cbind(arimax_training[,"zone_2_hourago"], arimax_training$wind_speed_in3hour))
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+```
+
+```{r}
+#third round, AIC does not significant decrease so stop after this
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = cbind(arimax_training[,"zone_2_hourago"], arimax_training$temperature_in3hour, arimax_training$humidity_in3hour))
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = cbind(arimax_training[,"zone_2_hourago"], arimax_training$temperature_in3hour, arimax_training$arimax_training$wind_speed_in3hour))
+model.sarma.resid$aic
+mean(residuals(model.sarma.resid)^2)
+```
+
+```{r}
+#final model
+model.sarma.resid = Arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = cbind(arimax_training[,"zone_2_hourago"], arimax_training$temperature_in3hour))
+```
+
+```{r}
+
+par(mfrow = c(1, 2))
+#acf plot
+acf(residuals(model.sarma.resid),lag.max=500, main = "ACF of Residuals of ARIMAX model")
+acf(residuals(model.sarma.resid)^2,lag.max=500, main = "ACF of Squared Residuals of ARIMAX model")
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+#sequential code for prediction, takes longer more than 20 minute
+fore.series.gamx = rep(0, length(arimax_testing$index))
+fore.series.armax = rep(0, length(arimax_testing$index))
+fore.sigmax = rep(0, length(arimax_testing$index))
+for(f in 1: length(arimax_testing$index)){
+    ## Fit models
+    data = arimax_training
+    if(f>=2){
+       data = rbind(data,arimax_testing[1:f-1,])
+    }
+    model <- gam(power_zone1~s(points)+hour+weekday+month,data=data)
+    model.resid = residuals(model)
+    model.sarma.resid = arima(model.resid, order = c(1,0,1),
+                      seasonal = list(order = c(1,0,1),period=24),method = "ML", xreg = cbind(data[,"zone_2_hourago"], data$temperature_in3hour))
+    outpred <- predict(model.sarma.resid, newxreg = cbind(arimax_testing[f,"zone_2_hourago"], arimax_testing[f,"temperature_in3hour"]))
+    
+    fore.series.gamx[f] = predict(model, newdata = arimax_testing[f,])
+    fore.series.armax[f] = outpred$pred
+    fore.sigmax[f] = outpred$se
+    print(f)
+}
+```
+
+```{r}
+#parallel code
+no_cores <- detectCores() - 1  # Leave one core free for other tasks
+cl <- makeCluster(no_cores)
+registerDoParallel(cl)
+
+fore.series.gamx <- rep(0, length(arimax_testing$index))
+fore.series.armax <- rep(0, length(arimax_testing$index))
+fore.sigmax <- rep(0, length(arimax_testing$index))
+
+# Parallel loop
+resultsx <- foreach(f = 1:length(arimax_testing$index), .combine = rbind, .packages = c("mgcv", "forecast")) %dopar% {
+    # Prepare the data
+    data <- if(f >= 2) rbind(arimax_training, arimax_testing[1:(f-1),]) else arimax_training
+
+    # Fit the GAM model
+    model <- gam(power_zone1 ~ s(points) + hour + weekday + month, data = data)
+    
+    # Work with residuals for ARIMA model
+    model.resid <- residuals(model)
+    model.sarma.resid <- arima(model.resid, order = c(1, 0, 1),
+                               seasonal = list(order = c(1, 0, 1), period = 24), method = "ML", 
+                               xreg = cbind(data[,"zone_2_hourago"], data$temperature_in3hour))
+    outpred <- predict(model.sarma.resid, newxreg = cbind(arimax_testing[f,"zone_2_hourago"], arimax_testing[f,"temperature_in3hour"]))
+    
+    # Combine the predictions and sigma into a single row
+    c(fore.series.gam = predict(model, newdata = arimax_testing[f,]), 
+      fore.series.arma = outpred$pred, 
+      fore.sigma = outpred$se)
+}
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+# Unlist and bind the results to the vectors
+fore.series.gamx <- resultsx[, "fore.series.gam.1"]
+fore.series.armax <- resultsx[, "fore.series.arma"]
+fore.sigmax <- resultsx[, "fore.sigma"]
+```
+
+```{r}
+plot(c(data_1hour_training$dateTime[(length(data_1hour_training$dateTime)-50):length(data_1hour_training$dateTime)], data_1hour_testing$dateTime), c(data_1hour_training$power_zone1[(length(data_1hour_training$dateTime)-50):length(data_1hour_training$dateTime)], data_1hour_testing$power_zone1) ,type = "l", main="Zone 1 Power Comsumption", xlab="Time", ylab="Power Consumption")
+points(arimax_testing$dateTime, fore.series.gamx+fore.series.armax, col = "red")
+lines(arimax_testing$dateTime, fore.series.gamx+fore.series.armax + 1.96*fore.sigmax, col = "blue")
+lines(arimax_testing$dateTime, fore.series.gamx+fore.series.armax - 1.96*fore.sigmax, col = "blue")
+
+legend("topleft",  # Adjust the location as needed
+       legend = c("Actual Power Consumption", "Predicted Power Consumption", "95% Confidence Interval"),
+       col = c("black", "red", "blue"),
+       lty = c(1, 0, 1),  # Line types: 1 for solid, 0 for points
+       pch = c(NA, 1, NA),  # Point characters: NA for none, 1 for points
+       lwd = c(1, 1, 1))  # Line widths
+```
+
+```{r}
+sqrt(mean((fore.series.gamx+fore.series.armax - data_1hour$power_zone1[(length(data_1hour$power_zone1)-2-length(arimax_testing$index)):(length(data_1hour$power_zone1)-3)])^2))
+
+mean(abs(fore.series.gamx+fore.series.armax - data_1hour$power_zone1[(length(data_1hour$power_zone1)-2-length(arimax_testing$index)):(length(data_1hour$power_zone1)-3)]))
+```
+
+## Vector AutoRegression models
+
+### VAR and Restricted VAR for data_1hour
+
+
+All roots of the characteristic polynomial are less than 1, meaning the VAR model for data_1hour is stable. However, the roots are extremely close to 1, so we may need to stay concerned about model stability.
+
+
+```{r}
+
+
+#Separate in training and testing (training all but two last weeks)
+index = nrow(data_1hour)- 24*14   #24 readings in a day for 14 days
+training_data_1hour <- data_1hour[1:index,] 
+testing_data_1hour <- data_1hour[index+1:nrow(data_1hour), ] 
+testing_data_1hour <- testing_data_1hour %>% drop_na
+
+#check correct lengths
+nrow(training_data_1hour) #8400 rows
+nrow(testing_data_1hour) #336 (14x24)
+
+#store date/time separately and remove from main dfs
+training_data_1hour_date <- training_data_1hour$dateTime
+testing_data_1hour_date <- testing_data_1hour$dateTime
+
+training_data_1hour <- dplyr::select(training_data_1hour, -c("index", "dateTime"))
+testing_data_1hour <- dplyr::select(testing_data_1hour, -c("index", "dateTime"))
+
+
+# identify best order FOR LAG 1
+var_order_1hour_lag1 <- VARselect(training_data_1hour, lag.max = 1, season = 24)
+var_order_1hour_lag1$selection
+
+selected_lag_1hour_lag1 <- var_order_1hour_lag1$selection[1]
+
+# var model
+var_model_1hour_lag1 <- VAR(training_data_1hour, p = selected_lag_1hour_lag1, type = "trend", season = 24)
+summary(var_model_1hour_lag1)
+
+# restricted VAR model
+restricted_var_model_1hour_lag1 = restrict(var_model_1hour_lag1)  
+summary(restricted_var_model_1hour_lag1)
+
+AIC(var_model_1hour_lag1) # unrestricted: 741673.1
+AIC(restricted_var_model_1hour_lag1) # restricted: 741359.2   ### this is lower, so restricted model is better
+
+# VARselect for Lag = 24
+var_order_1hour_lag24 <- VARselect(training_data_1hour, lag.max = 24, season = 24)
+var_order_1hour_lag24$selection
+
+selected_lag_1hour_lag24 <- var_order_1hour_lag24$selection[1]
+
+# var model
+var_model_1hour_lag24 <- VAR(training_data_1hour, p = selected_lag_1hour_lag24, type = "trend", season = 24)
+summary(var_model_1hour_lag24)
+
+# restricted VAR model for lag = 24
+restricted_var_model_1hour_lag24 = restrict(var_model_1hour_lag24)  
+summary(restricted_var_model_1hour_lag24)
+
+AIC(var_model_1hour_lag24) # unrestricted: 728000
+AIC(restricted_var_model_1hour_lag24) # restricted: 726770.6   ### this is lower, so restricted model is better
+
+```
+
+## Use Restricted VAR Model for Prediction
+
+``` {r}
+
+forecast_var_lag1 <- predict(restricted_var_model_1hour_lag1, n.ahead = 336, ci = 0.95) # forecasting 24 hours ahead
+
+# the following are the predicted data points for each power zone
+forecast_var_lag1$fcst$power_zone1
+forecast_var_lag1$fcst$power_zone2
+forecast_var_lag1$fcst$power_zone3
+
+#Determine MAE for lag =1
+lag_1_mae = mean(abs(forecast_var_lag1$fcst$power_zone1[,1]-testing_data_1hour$power_zone1))
+# lag_1_mae = 16879.39
+
+#RMSE for lag = 1
+lag_1_rmse <- sqrt(mean((forecast_var_lag1$fcst$power_zone1[,1]-testing_data_1hour$power_zone1)^2))
+lag_1_rmse # 21196.47
+
+
+#forecast for lag = 24
+forecast_var_lag24 <- predict(restricted_var_model_1hour_lag24, n.ahead = 336, ci = 0.95) # forecasting 24 hours ahead
+
+# the following are the predicted data points for each power zone
+forecast_var_lag24$fcst$power_zone1
+forecast_var_lag24$fcst$power_zone2
+forecast_var_lag24$fcst$power_zone3
+
+
+#Determine MAE for lag = 24
+lag_24_mae = mean(abs(forecast_var_lag24$fcst$power_zone1[,1]-testing_data_1hour$power_zone1))
+lag_24_mae # 9884.841
+
+#RMSE for lag = 24
+lag_24_rmse <- sqrt(mean((forecast_var_lag24$fcst$power_zone1[,1]-testing_data_1hour$power_zone1)^2))
+lag_24_rmse # 13036.43
+
+# IN CONCLUSION:
+#  Lag = 24 VAR model is the best VAR model (by MAE and RMSE)
+```
+
+
+## Use VAR Model for Prediction
+
+``` {r}
+
+forecast_var_lag1 <- predict(var_model_1hour_lag1, n.ahead = 336, ci = 0.95) # forecasting 24 hours ahead
+
+# the following are the predicted data points for each power zone
+forecast_var_lag1$fcst$power_zone1
+forecast_var_lag1$fcst$power_zone2
+forecast_var_lag1$fcst$power_zone3
+
+#Determine MAE for lag =1
+lag_1_mae = mean(abs(forecast_var_lag1$fcst$power_zone1[,1]-testing_data_1hour$power_zone1))
+# lag_1_mae = 17162.08
+
+#RMSE for lag = 1
+lag_1_rmse <- sqrt(mean((forecast_var_lag1$fcst$power_zone1[,1]-testing_data_1hour$power_zone1)^2))
+lag_1_rmse # 21364.37
+
+#forecast for lag = 24
+forecast_var_lag24 <- predict(var_model_1hour_lag24, n.ahead = 336, ci = 0.95) # forecasting 24 hours ahead
+
+# the following are the predicted data points for each power zone
+forecast_var_lag24$fcst$power_zone1
+forecast_var_lag24$fcst$power_zone2
+forecast_var_lag24$fcst$power_zone3
+
+
+#Determine MAE for lag = 24
+lag_24_mae = mean(abs(forecast_var_lag24$fcst$power_zone1[,1]-testing_data_1hour$power_zone1))
+lag_24_mae # 9617.768
+
+#RMSE for lag = 24
+lag_24_rmse <- sqrt(mean((forecast_var_lag24$fcst$power_zone1[,1]-testing_data_1hour$power_zone1)^2))
+lag_24_rmse # 12727.5
+
+# IN CONCLUSION:
+#  Lag = 24 VAR model is the best VAR model (by MAE and RMSE)
+```
+
+
+## Plot VAR Model of Lag = 24 for Power Zones Actual Data vs Predicted
+```{r}
+
+plot(testing_data_1hour_date, testing_data_1hour$power_zone1, type = "l", main = "VAR Model with Lag = 24 Power Zone 1 Actual Data vs Predicted", xlab = "Date", ylab = "Restricted VAR Power Zone 1 Energy Consumption", col = "black", lwd = 2, ylim = c(70000, 300000)) #Plot actual values for Power Zone 1
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone1[,1], col = "red", lty = 1, lwd = 2) # plot predicted values for Power Zone 1
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone1[,2], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 1
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone1[,3], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 1
+legend("bottomleft", legend = c("Actual Data", "Predicted Values", "95% Confidence Interval"), col = c("black", "red", "blue"), lty = c(1, 1, 2), lwd = c(2, 2, 2), cex = 0.6) #legend for the graph
+
+plot(testing_data_1hour_date, testing_data_1hour$power_zone2, type = "l", main = "VAR Model with Lag = 24 Power Zone 2 Actual Data vs Predicted", xlab = "Date", ylab = "Restricted VAR Power Zone 2 Energy Consumption", col = "black", lwd = 2, ylim = c(50000, 230000)) #Plot actual values for Power Zone 1
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone2[,1], col = "red", lty = 1, lwd = 2) # plot predicted values for Power Zone 2
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone2[,2], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 2
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone2[,3], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 2
+legend("bottomleft", legend = c("Actual Data", "Predicted Values", "95% Confidence Interval"), col = c("black", "red", "blue"), lty = c(1, 1, 2), lwd = c(2, 2, 2), cex = 0.6) #legend for the graph
+
+plot(testing_data_1hour_date, testing_data_1hour$power_zone3, type = "l", main = "VAR Model with Lag = 24 Power Zone 3 Actual Data vs Predicted", xlab = "Date", ylab = "Restricted VAR Power Zone 3 Energy Consumption", col = "black", lwd = 2, ylim = c(0, 140000)) #Plot actual values for Power Zone 1
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone3[,1], col = "red", lty = 1, lwd = 2) # plot predicted values for Power Zone 3
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone3[,2], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 3
+lines(testing_data_1hour_date, forecast_var_lag24$fcst$power_zone3[,3], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 3
+legend("bottomleft", legend = c("Actual Data", "Predicted Values", "95% Confidence Interval"), col = c("black", "red", "blue"), lty = c(1, 1, 2), lwd = c(2, 2, 2), cex = 0.6) #legend for the graph
+
+```
+
+
+### Goodness of fit tests for the VAR model
+The VAR model is not a good fit due to:
+  the constant variance test indicating non-constant variance
+  the normal distribution test indicating a non-normal distribution
+  the serial correlation test indicating serial correlation
+  
+```{r}
+
+### restricted VAR with lag = 24
+residuals_var_model_1hour_lag24 <- residuals(var_model_1hour_lag24)
+plot(residuals_var_model_1hour_lag24[, "power_zone1"])
+plot(residuals_var_model_1hour_lag24[, "power_zone2"])
+plot(residuals_var_model_1hour_lag24[, "power_zone3"])
+acf(residuals_var_model_1hour_lag24, lag.max = 24)
+
+# constant variance test
+arch.test(var_model_1hour_lag24)
+# low p-value of p < 2.2e-16 indicates non constant variance
+
+# normal distribution test
+normality.test(var_model_1hour_lag24)
+# low p-values of p < 2.2e-16 indicate a not normal distribution
+
+# serial correlation test
+serial.test(var_model_1hour_lag1)
+# low p-value of p < 2.2e-16 indicates serial correlation
+```
+
+## VARX
+
+Develop exogenous VAR model on the energy consumption in the three zones, with temperature, humidity, wind speed, and general diffuse flows as the exogenous variables.  
+
+```{r}
+#VARX with Lag = 1
+
+training = data_1hour[, c("temperature", "humidity", "wind_speed",
+                               "general_diffuse_flows", "power_zone1",
+                               "power_zone2", "power_zone3")]
+
+
+#using training and testing data from VAR model above
+training_data_1hour
+testing_data_1hour
+
+#only have power consumption as the response, create exogenous with 24 lag (prediction will depend on the temperature at the same time of the day, the previous day)
+index = nrow(training_data_1hour)
+training_data_varx = training_data_1hour[25:index,c("power_zone1", "power_zone2", "power_zone3")]
+
+#exogenous var, one lag 
+training_ex = training_data_1hour[1:(index-24), c("temperature", "humidity", "wind_speed", "general_diffuse_flows")]
+testing_ex = testing_data_1hour[, c("temperature", "humidity", "wind_speed", "general_diffuse_flows")]
+
+varx_selec_lag1 = VARselect(training_data_varx, lag.max = 1, season = 24,
+          exogen = training_ex , type = "both")$selection
+
+varx_selec_aic_lag1 = varx_selec_lag1[1]
+
+# Fit the exogenous VAR model using AIC (24)
+var_model_exogenous_lag1 <- VAR(training_data_varx, p = varx_selec_aic_lag1, type = "both", season = 24, exogen = training_ex)
+summary(var_model_exogenous_lag1)
+```
+
+
+``` {r}
+#VARX with Lag = 24
+
+training = data_1hour[, c("temperature", "humidity", "wind_speed",
+                               "general_diffuse_flows", "power_zone1",
+                               "power_zone2", "power_zone3")]
+
+
+#using training and testing data from VAR model above
+training_data_1hour
+testing_data_1hour
+
+#only have power consumption as the response, create exogenous with 24 lag (prediction will depend on the temperature at the same time of the day, the previous day)
+index = nrow(training_data_1hour)
+training_data_varx = training_data_1hour[25:index,c("power_zone1", "power_zone2", "power_zone3")]
+
+#exogenous var, one lag 
+training_ex = training_data_1hour[1:(index-24), c("temperature", "humidity", "wind_speed", "general_diffuse_flows")]
+testing_ex = testing_data_1hour[, c("temperature", "humidity", "wind_speed", "general_diffuse_flows")]
+
+varx_selec_lag24 = VARselect(training_data_varx, lag.max = 24, season = 24,
+          exogen = training_ex , type = "both")$selection
+
+varx_selec_aic_lag24 = varx_selec_lag24[1]
+
+# Fit the exogenous VAR model using AIC (24)
+var_model_exogenous_lag24 <- VAR(training_data_varx, p = varx_selec_aic_lag24, type = "both", season = 24, exogen = training_ex)
+summary(var_model_exogenous_lag24)
+
+```
+
+## Use VARX Model for Prediction
+
+``` {r}
+# Predict future values ahead = 336 with exogenous variables
+forecast_varx_lag1 <- predict(var_model_exogenous_lag1, n.ahead = 336, ci = 0.95, dumvar = testing_ex) # forecasting 24 hours ahead
+
+# the following are the predicted data points for each power zone
+forecast_varx_lag1$fcst$power_zone1
+forecast_varx_lag1$fcst$power_zone2
+forecast_varx_lag1$fcst$power_zone3
+
+#Determine MAE for lag =1
+lag_1_mae = mean(abs(forecast_varx_lag1$fcst$power_zone1[,1]-testing_data_1hour$power_zone1))
+# lag_1_mae = 10442.62
+
+#RMSE for lag = 1
+lag_1_rmse <- sqrt(mean((forecast_varx_lag1$fcst$power_zone1[,1]-testing_data_1hour$power_zone1)^2))
+lag_1_rmse # 13713.36
+
+#forecast for lag = 24
+forecast_varx_lag24 <- predict(var_model_exogenous_lag24, n.ahead = 336, ci = 0.95, dumvar = testing_ex) # forecasting 24 hours ahead
+
+# the following are the predicted data points for each power zone
+forecast_varx_lag24$fcst$power_zone1
+forecast_varx_lag24$fcst$power_zone2
+forecast_varx_lag24$fcst$power_zone3
+
+
+#Determine MAE for lag = 24
+lag_24_mae = mean(abs(forecast_varx_lag24$fcst$power_zone1[,1]-testing_data_1hour$power_zone1))
+# lag_24_mae # 8605.923
+
+#RMSE for lag = 24
+lag_24_rmse <- sqrt(mean((forecast_varx_lag24$fcst$power_zone1[,1]-testing_data_1hour$power_zone1)^2))
+lag_24_rmse # 11427.67
+
+#CONCLUSION: The VARX model with lag = 24 is the best of the VAR/VARX models due to lowest MSE and RMSE.
+
+```
+
+
+The VARX model with lag = 24 is not a good fit due to:
+  the constant variance test indicating non-constant variance
+  the normal distribution test indicating a non-normal distribution
+  the serial correlation test indicating serial correlation
+  
+```{r}
+
+### VARX with lag = 24
+residuals_varx_model_1hour_lag24 <- residuals(var_model_exogenous_lag24)
+plot(residuals_varx_model_1hour_lag24[, "power_zone1"])
+plot(residuals_varx_model_1hour_lag24[, "power_zone2"])
+plot(residuals_varx_model_1hour_lag24[, "power_zone3"])
+acf(residuals_varx_model_1hour_lag24, lag.max = 24)
+
+# constant variance test
+arch.test(var_model_exogenous_lag24)
+# low p-value of p < 2.2e-16 indicates non constant variance
+
+# normal distribution test
+normality.test(var_model_exogenous_lag24)
+# low p-values of p < 2.2e-16 indicate a not normal distribution
+
+# serial correlation test
+serial.test(var_model_exogenous_lag1)
+# low p-value of p < 2.2e-16 indicates serial correlation
+```
+
+
+## Plot VARX Model for Power Zones Actual Data vs Predicted
+```{r}
+
+plot(testing_data_1hour_date, testing_data_1hour$power_zone1, type = "l", main = "VARX (Lag = 24) Power Zone 1 Actual Data vs Predicted", xlab = "Date", ylab = "Power Zone 1 Energy Consumption", col = "black", lwd = 2, ylim = c(70000, 300000)) #Plot actual values for Power Zone 1
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone1[,1], col = "red", lty = 1, lwd = 2) # plot predicted values for Power Zone 1
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone1[,2], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 1
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone1[,3], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 1
+legend("bottomleft", legend = c("Actual Data", "Predicted Values", "95% Confidence Interval"), col = c("black", "red", "blue"), lty = c(1, 1, 2), lwd = c(2, 2, 2), cex = 0.6) #legend for the graph
+
+plot(testing_data_1hour_date, testing_data_1hour$power_zone2, type = "l", main = "VARX (Lag = 24) Power Zone 2 Actual Data vs Predicted", xlab = "Date", ylab = "Power Zone 2 Energy Consumption", col = "black", lwd = 2, ylim = c(50000, 230000)) #Plot actual values for Power Zone 1
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone2[,1], col = "red", lty = 1, lwd = 2) # plot predicted values for Power Zone 2
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone2[,2], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 2
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone2[,3], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 2
+legend("bottomleft", legend = c("Actual Data", "Predicted Values", "95% Confidence Interval"), col = c("black", "red", "blue"), lty = c(1, 1, 2), lwd = c(2, 2, 2), cex = 0.6) #legend for the graph
+
+plot(testing_data_1hour_date, testing_data_1hour$power_zone3, type = "l", main = "VARX (Lag = 24) Power Zone 3 Actual Data vs Predicted", xlab = "Date", ylab = "Power Zone 3 Energy Consumption", col = "black", lwd = 2, ylim = c(0, 140000)) #Plot actual values for Power Zone 1
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone3[,1], col = "red", lty = 1, lwd = 2) # plot predicted values for Power Zone 3
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone3[,2], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 3
+lines(testing_data_1hour_date, forecast_varx_lag24$fcst$power_zone3[,3], col = "blue", lty = 2, lwd = 2) # plot lower confidence interval for Power Zone 3
+legend("bottomleft", legend = c("Actual Data", "Predicted Values", "95% Confidence Interval"), col = c("black", "red", "blue"), lty = c(1, 1, 2), lwd = c(2, 2, 2), cex = 0.6) #legend for the graph
+
+```
